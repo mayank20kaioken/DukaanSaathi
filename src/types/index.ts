@@ -202,24 +202,34 @@ export interface ScannedBillItem {
   rate: number;
   taxRate: number;
   amount: number;
+  printedAmount?: number;
   matchedProductId?: string;
+  hasLineDiscrepancy?: boolean;
 }
 
 export interface ScannedBill {
   id: string;
   imageUrl?: string;
+  fileName?: string;
+  fileSize?: string;
   supplierName: string;
   invoiceNo: string;
   date: string;
   items: ScannedBillItem[];
   calculatedSubtotal: number;
   taxAmount: number;
+  discount: number;
   calculatedTotal: number;
   printedTotal: number;
+  receivedAmount?: number;
+  dueBalance?: number;
   difference: number;
-  confidence: number;
+  confidence?: number;
   status: 'PENDING_REVIEW' | 'VERIFIED' | 'REJECTED';
   warnings: string[];
+  extractionStatus?: 'SUCCESS' | 'PARTIAL' | 'FAILED' | 'MANUAL';
+  isSampleDemo?: boolean;
+  rawText?: string;
 }
 
 export interface BusinessHealthBreakdown {

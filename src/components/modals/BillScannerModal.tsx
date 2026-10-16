@@ -1,23 +1,19 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { useApp } from '../../context/AppContext';
 import { 
-  Camera, 
+  X, 
   Upload, 
+  Camera, 
   RefreshCw, 
   CheckCircle2, 
   AlertTriangle, 
-  FileText, 
-  X, 
-  Trash2, 
   Plus, 
-  ShieldCheck, 
-  Sparkles,
-  ArrowRight,
-  Eye,
-  Info
+  Trash2, 
+  ArrowRight, 
+  ArrowLeft
 } from 'lucide-react';
 import { BillScannerService, SAMPLE_INVOICE_PRESETS } from '../../services/ocrService';
-import { ScannedBill, ScannedBillItem } from '../../types';
+import { ScannedBill, ScannedBillItem, UnitType } from '../../types';
 import { formatINR } from '../../utils/formatters';
 
 interface BillScannerModalProps {
@@ -26,44 +22,103 @@ interface BillScannerModalProps {
 }
 
 export const BillScannerModal: React.FC<BillScannerModalProps> = ({ isOpen, onClose }) => {
-  const { recordExpense, adjustStock, products, addToast, language } = useApp();
-  const isHi = language === 'hi';
+  const { recordExpense, adjustStock, products, addToast } = useApp();
 
-  const [activeTab, setActiveTab] = useState<'upload' | 'camera' | 'presets'>('presets');
-  const [selectedImage, setSelectedImage] = useState<string | null>(SAMPLE_INVOICE_PRESETS[0].imageUrl);
-  const [isScanning, setIsScanning] = useState(false);
-  const [scanStatus, setScanStatus] = useState<string>('');
-  const [scanProgress, setScanProgress] = useState<number>(0);
-  
+  // 3-step workflow state: 1 (Upload), 2 (Review), 3 (Confirm)
+  const [currentStep, setCurrentStep] = useState<1 | 2 | 3>(1);
+
+  // Selected image state
+  const [selectedImage, setSelectedImage] = useState<string | null>(null);
+  const [fileName, setFileName] = useState<string>('');
+  const [fileSize, setFileSize] = useState<string>('');
+  const [isDragOver, setIsDragOver] = useState(false);
+
   // Camera state
   const videoRef = useRef<HTMLVideoElement>(null);
   const [cameraActive, setCameraActive] = useState(false);
   const [cameraStream, setCameraStream] = useState<MediaStream | null>(null);
 
-  // Parsed / Editable Bill State
-  const [parsedBill, setParsedBill] = useState<ScannedBill | null>(null);
-  const [verifiedByUser, setVerifiedByUser] = useState(false);
-  const [updateStockChecked, setUpdateStockChecked] = useState(true);
+  // OCR Execution State
+  const [isScanning, setIsScanning] = useState(false);
+  const [scanStatus, setScanStatus] = useState<string>('');
+  const [scanProgress, setScanProgress] = useState<number>(0);
+  const activeExtractionId = useRef<string>('');
 
-  // Initialize with the first sample invoice pre-parsed for instant review
+  // Parsed / Editable Bill State
+  const [bill, setBill] = useState<ScannedBill | null>(null);
+
+  // Confirm state
+  const [updateStockChecked, setUpdateStockChecked] = useState(false); // OFF by default
+  const [isSaving, setIsSaving] = useState(false);
+  const [saveSuccess, setSaveSuccess] = useState(false);
+
+  // Reset when modal opens/closes
   useEffect(() => {
-    if (isOpen && !parsedBill) {
-      handleLoadPreset(SAMPLE_INVOICE_PRESETS[0]);
+    if (!isOpen) {
+      if (cameraStream) {
+        cameraStream.getTracks().forEach(track => track.stop());
+        setCameraStream(null);
+      }
+      setCameraActive(false);
+      setIsScanning(false);
+      setSaveSuccess(false);
+    } else {
+      setCurrentStep(1);
+      setSelectedImage(null);
+      setFileName('');
+      setBill(null);
+      setSaveSuccess(false);
     }
   }, [isOpen]);
 
-  // Clean up camera stream on close
-  useEffect(() => {
-    return () => {
-      if (cameraStream) {
-        cameraStream.getTracks().forEach(track => track.stop());
-      }
-    };
-  }, [cameraStream]);
+  if (!isOpen) return null;
 
-  const startCamera = async () => {
+  const handleFile = (file: File) => {
+    setBill(null);
+    setSaveSuccess(false);
+
+    const sizeFormatted = file.size > 1024 * 1024 
+      ? `${(file.size / (1024 * 1024)).toFixed(1)} MB` 
+      : `${Math.round(file.size / 1024)} KB`;
+    
+    setFileName(file.name);
+    setFileSize(sizeFormatted);
+
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const dataUrl = event.target?.result as string;
+      setSelectedImage(dataUrl);
+      setCurrentStep(2);
+      startOcrScan(file, dataUrl, file.name, sizeFormatted);
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const handleFileInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) handleFile(file);
+  };
+
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragOver(true);
+  };
+
+  const handleDragLeave = () => {
+    setIsDragOver(false);
+  };
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragOver(false);
+    const file = e.dataTransfer.files?.[0];
+    if (file && file.type.startsWith('image/')) {
+      handleFile(file);
+    }
+  };
+
+  const handleStartCamera = async () => {
     try {
-      setActiveTab('camera');
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } }
       });
@@ -73,12 +128,12 @@ export const BillScannerModal: React.FC<BillScannerModalProps> = ({ isOpen, onCl
         videoRef.current.play();
       }
       setCameraActive(true);
-    } catch (err) {
-      alert("Unable to access camera. Please ensure permissions are granted or use file upload / presets.");
+    } catch {
+      alert("Unable to access camera. Please allow camera permissions or upload an image file.");
     }
   };
 
-  const capturePhoto = () => {
+  const handleCapturePhoto = () => {
     if (!videoRef.current) return;
     const canvas = document.createElement('canvas');
     canvas.width = videoRef.current.videoWidth || 640;
@@ -87,445 +142,475 @@ export const BillScannerModal: React.FC<BillScannerModalProps> = ({ isOpen, onCl
     if (ctx) {
       ctx.drawImage(videoRef.current, 0, 0, canvas.width, canvas.height);
       const dataUrl = canvas.toDataURL('image/jpeg');
-      setSelectedImage(dataUrl);
-      // Stop camera
+
       if (cameraStream) {
         cameraStream.getTracks().forEach(track => track.stop());
         setCameraStream(null);
       }
       setCameraActive(false);
-      runOcr(dataUrl);
+
+      setSelectedImage(dataUrl);
+      setFileName('camera-capture.jpg');
+      setFileSize('Direct Capture');
+      setCurrentStep(2);
+      startOcrScan(dataUrl, dataUrl, 'camera-capture.jpg', 'Direct Capture');
     }
   };
 
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) {
-      const reader = new FileReader();
-      reader.onload = (event) => {
-        const url = event.target?.result as string;
-        setSelectedImage(url);
-        runOcr(file);
-      };
-      reader.readAsDataURL(file);
+  const handleCloseCamera = () => {
+    if (cameraStream) {
+      cameraStream.getTracks().forEach(track => track.stop());
+      setCameraStream(null);
     }
+    setCameraActive(false);
   };
 
-  const handleLoadPreset = (preset: typeof SAMPLE_INVOICE_PRESETS[0]) => {
-    setSelectedImage(preset.imageUrl);
-    const mock = BillScannerService.createMockParsedBill(
-      preset.supplierName,
-      preset.invoiceNo,
-      preset.items,
-      preset.printedTotal
-    );
-    mock.imageUrl = preset.imageUrl;
-    mock.date = preset.date;
-    setParsedBill(mock);
-    setVerifiedByUser(false);
-  };
+  const startOcrScan = async (source: File | string, previewUrl: string, name: string, size?: string) => {
+    const extractionId = `ext-${Date.now()}`;
+    activeExtractionId.current = extractionId;
 
-  const runOcr = async (source: string | File) => {
     setIsScanning(true);
     setScanProgress(15);
-    setScanStatus('Loading OCR Engine & analyzing receipt...');
+    setScanStatus('Reading invoice layout with Tesseract OCR...');
 
     try {
-      const bill = await BillScannerService.processInvoiceImage(source, (status, prog) => {
-        setScanStatus(status);
-        setScanProgress(prog);
-      });
-      setParsedBill(bill);
-      setVerifiedByUser(false);
-      addToast('info', 'OCR Analysis Ready', 'Please review all extracted line items and mathematical checks.');
-    } catch (err) {
-      addToast('error', 'OCR Processing Failed', 'Could not read text clearly. You can still input details manually.');
+      const parsed = await BillScannerService.processInvoiceImage(
+        source,
+        name,
+        size,
+        (status, prog) => {
+          if (activeExtractionId.current === extractionId) {
+            setScanStatus(status);
+            setScanProgress(prog);
+          }
+        }
+      );
+
+      if (activeExtractionId.current === extractionId) {
+        parsed.imageUrl = previewUrl;
+        setBill(parsed);
+      }
+    } catch (err: any) {
+      if (activeExtractionId.current === extractionId) {
+        console.warn('OCR error in modal:', err);
+        setBill({
+          id: `bill-${Date.now()}`,
+          imageUrl: previewUrl,
+          fileName: name,
+          fileSize: size,
+          supplierName: '',
+          invoiceNo: '',
+          date: new Date().toISOString().split('T')[0],
+          items: [],
+          calculatedSubtotal: 0,
+          taxAmount: 0,
+          discount: 0,
+          calculatedTotal: 0,
+          printedTotal: 0,
+          difference: 0,
+          status: 'PENDING_REVIEW',
+          warnings: ['Could not read text automatically. Please enter details manually.'],
+          extractionStatus: 'FAILED',
+          isSampleDemo: false
+        });
+      }
     } finally {
-      setIsScanning(false);
+      if (activeExtractionId.current === extractionId) {
+        setIsScanning(false);
+      }
     }
   };
 
-  // Field edits
-  const handleItemChange = (index: number, field: keyof ScannedBillItem, value: any) => {
-    if (!parsedBill) return;
-    const items = [...parsedBill.items];
-    items[index] = { ...items[index], [field]: value };
-    // Recalculate item amount
-    items[index].amount = Number((items[index].quantity * items[index].rate).toFixed(2));
-    
-    // Recalculate bill totals
-    const subtotal = items.reduce((sum, item) => sum + (item.quantity * item.rate), 0);
-    const taxAmount = items.reduce((sum, item) => sum + ((item.quantity * item.rate) * (item.taxRate / 100)), 0);
-    const calculatedTotal = Number((subtotal + taxAmount).toFixed(2));
-    const difference = Number((calculatedTotal - parsedBill.printedTotal).toFixed(2));
+  const handleLoadSample = (presetId: string) => {
+    const sample = BillScannerService.createSampleBill(presetId);
+    setSelectedImage(sample.imageUrl || null);
+    setFileName(sample.fileName || 'Sample_Invoice.svg');
+    setFileSize(sample.fileSize || '48 KB');
+    setBill(sample);
+    setCurrentStep(2);
+  };
 
-    const warnings: string[] = [];
-    if (Math.abs(difference) > 1.0) {
-      warnings.push(`Mathematical discrepancy detected: Sum of items (${calculatedTotal}) differs from printed invoice total (${parsedBill.printedTotal}) by ${Math.abs(difference)}.`);
+  const handleClearImage = () => {
+    activeExtractionId.current = '';
+    setSelectedImage(null);
+    setFileName('');
+    setFileSize('');
+    setBill(null);
+    setSaveSuccess(false);
+    setCurrentStep(1);
+    handleCloseCamera();
+  };
+
+  const handleFieldChange = (field: keyof ScannedBill, value: any) => {
+    if (!bill) return;
+    setBill(BillScannerService.recalculateBill({ ...bill, [field]: value }));
+  };
+
+  const handleItemChange = (index: number, field: keyof ScannedBillItem, value: any) => {
+    if (!bill) return;
+    const newItems = [...bill.items];
+    const current = { ...newItems[index], [field]: value };
+
+    if (field === 'quantity' || field === 'rate' || field === 'taxRate') {
+      const q = field === 'quantity' ? Number(value) : current.quantity;
+      const r = field === 'rate' ? Number(value) : current.rate;
+      const t = field === 'taxRate' ? Number(value) : current.taxRate;
+      current.amount = Number((q * r + (t || 0)).toFixed(2));
+      current.printedAmount = current.amount;
+      current.hasLineDiscrepancy = false;
+    } else if (field === 'amount') {
+      current.printedAmount = Number(value);
+      const expected = current.quantity * current.rate + (current.taxRate || 0);
+      current.hasLineDiscrepancy = Math.abs(current.printedAmount - expected) > 0.5;
     }
 
-    setParsedBill({
-      ...parsedBill,
-      items,
-      calculatedSubtotal: subtotal,
-      taxAmount: Number(taxAmount.toFixed(2)),
-      calculatedTotal,
-      difference,
-      warnings
-    });
+    newItems[index] = current;
+    setBill(BillScannerService.recalculateBill({ ...bill, items: newItems }));
   };
 
   const handleAddItem = () => {
-    if (!parsedBill) return;
+    if (!bill) return;
     const newItem: ScannedBillItem = {
-      id: `bi-${Date.now()}`,
-      name: 'New Item (Manual entry)',
+      id: `item-${Date.now()}`,
+      name: 'New Product Item',
       quantity: 1,
-      unit: 'packet',
+      unit: 'piece' as UnitType,
       rate: 100,
-      taxRate: 5,
-      amount: 100
+      taxRate: 0,
+      amount: 100,
+      printedAmount: 100
     };
-    const items = [...parsedBill.items, newItem];
-    const subtotal = items.reduce((s, i) => s + i.amount, 0);
-    setParsedBill({
-      ...parsedBill,
-      items,
-      calculatedSubtotal: subtotal,
-      calculatedTotal: subtotal
-    });
+    setBill(BillScannerService.recalculateBill({ ...bill, items: [...bill.items, newItem] }));
   };
 
   const handleDeleteItem = (index: number) => {
-    if (!parsedBill) return;
-    const items = parsedBill.items.filter((_, i) => i !== index);
-    const subtotal = items.reduce((s, i) => s + i.amount, 0);
-    setParsedBill({
-      ...parsedBill,
-      items,
-      calculatedSubtotal: subtotal,
-      calculatedTotal: subtotal
-    });
+    if (!bill) return;
+    const newItems = bill.items.filter((_, idx) => idx !== index);
+    setBill(BillScannerService.recalculateBill({ ...bill, items: newItems }));
   };
 
-  const handleSaveVerifiedBill = () => {
-    if (!parsedBill) return;
-    if (!verifiedByUser) {
-      alert("Please confirm the verification checkbox to verify you have reviewed the numbers.");
+  const handleSaveConfirmedExpense = async () => {
+    if (!bill) return;
+    if (!bill.supplierName.trim()) {
+      alert("Please provide a supplier name before recording the expense.");
       return;
     }
 
-    // 1. Record expense
-    recordExpense({
-      category: 'SUPPLIER_PURCHASE',
-      categoryLabel: `Wholesale Stock Purchase (${parsedBill.supplierName})`,
-      categoryLabelHi: `थोक सामान खरीद (${parsedBill.supplierName})`,
-      amount: parsedBill.printedTotal || parsedBill.calculatedTotal,
-      supplierName: parsedBill.supplierName,
-      paymentMethod: 'UPI',
-      invoiceNo: parsedBill.invoiceNo,
-      notes: `Verified from OCR scanned invoice #${parsedBill.invoiceNo}. Total items: ${parsedBill.items.length}.`,
-      verifiedFromBill: true
-    });
+    setIsSaving(true);
 
-    // 2. Optionally update inventory stock if user approved
-    if (updateStockChecked) {
-      parsedBill.items.forEach(item => {
-        // match by productId or name
-        const match = products.find(p => p.id === item.matchedProductId || p.name.toLowerCase().includes(item.name.toLowerCase().slice(0, 8)));
-        if (match) {
-          adjustStock(match.id, item.quantity, `Stock inward from Bill #${parsedBill.invoiceNo}`);
-        }
+    try {
+      const finalAmount = bill.printedTotal > 0 ? bill.printedTotal : bill.calculatedTotal;
+      recordExpense({
+        category: 'SUPPLIER_PURCHASE',
+        categoryLabel: `Wholesale Purchase (${bill.supplierName})`,
+        categoryLabelHi: `थोक सामान खरीद (${bill.supplierName})`,
+        amount: finalAmount,
+        supplierName: bill.supplierName,
+        paymentMethod: 'UPI',
+        invoiceNo: bill.invoiceNo || `INV-${Date.now().toString().slice(-6)}`,
+        notes: `Recorded via AI Bill Scanner. ${bill.warnings.length > 0 ? 'Discrepancy noted.' : 'Reconciled.'}`,
+        verifiedFromBill: true
       });
-      addToast('success', 'Stock Inward Completed', 'Inventory quantities updated for matched products.');
-    }
 
-    addToast('success', 'Bill Verified & Saved', `Expense of ${formatINR(parsedBill.printedTotal)} recorded under Supplier Purchases.`);
-    onClose();
+      if (updateStockChecked && bill.items.length > 0) {
+        bill.items.forEach(item => {
+          const matched = products.find(p => 
+            p.id === item.matchedProductId || 
+            p.name.toLowerCase().includes(item.name.toLowerCase().slice(0, 8))
+          );
+          if (matched) {
+            adjustStock(matched.id, item.quantity, `Stock inward from Bill #${bill.invoiceNo || 'Scanned'}`);
+          }
+        });
+      }
+
+      setSaveSuccess(true);
+      addToast('success', 'Invoice Saved', `Expense of ${formatINR(finalAmount)} recorded.`);
+    } catch (err: any) {
+      console.error('Save expense failed:', err);
+    } finally {
+      setIsSaving(false);
+    }
   };
 
-  if (!isOpen) return null;
-
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-md p-3 sm:p-5">
-      <div className="relative w-full max-w-6xl bg-navy-900 border border-slate-700 rounded-3xl shadow-2xl flex flex-col h-[90vh] overflow-hidden">
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-5 bg-navy-950/80 backdrop-blur-sm animate-in fade-in">
+      <div className="relative w-full max-w-4xl max-h-[92vh] overflow-y-auto bg-navy-900 border border-slate-700 rounded-3xl shadow-2xl flex flex-col">
         
-        {/* Header */}
-        <div className="px-6 py-4 bg-navy-950 border-b border-slate-800 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-2xl bg-gradient-to-tr from-mint-accent/20 to-lime-accent/20 border border-mint-accent/40 flex items-center justify-center text-mint-accent shadow-mint-glow">
-              <Camera className="w-5 h-5" />
+        {/* Top Header */}
+        <div className="flex items-center justify-between p-5 border-b border-slate-800 shrink-0">
+          <div className="flex items-center gap-2.5">
+            <div className="w-8 h-8 rounded-xl bg-lime-accent/20 text-lime-accent flex items-center justify-center border border-lime-accent/30">
+              <Upload className="w-4 h-4" />
             </div>
             <div>
-              <div className="flex items-center gap-2">
-                <h3 className="font-extrabold text-base text-white">
-                  {isHi ? 'एआई थोक बिल एवं पर्ची स्कैनर' : 'AI Invoice Scanner & Stock Reconciliation'}
-                </h3>
-                <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-mint-accent/20 text-mint-accent border border-mint-accent/30">
-                  OCR Engine
-                </span>
-              </div>
-              <p className="text-xs text-slate-400">
-                Extract line items, cross-check mathematical totals, and reconcile inventory stock.
-              </p>
+              <h2 className="text-base font-extrabold text-white">AI Invoice Scanner</h2>
+              <p className="text-[11px] text-slate-400">Scan distributor bills, verify totals & inward stock</p>
             </div>
           </div>
 
           <button
             onClick={onClose}
-            className="p-2 rounded-xl bg-navy-800 hover:bg-navy-700 text-slate-400 hover:text-white transition-colors"
+            className="p-2 rounded-xl text-slate-400 hover:text-white hover:bg-slate-800 transition-colors"
           >
             <X className="w-5 h-5" />
           </button>
         </div>
 
-        {/* Tab Controls */}
-        <div className="px-6 py-2.5 bg-navy-900/90 border-b border-slate-800 flex items-center justify-between gap-4">
-          <div className="flex items-center gap-2">
-            <button
-              onClick={() => setActiveTab('presets')}
-              className={`px-3 py-1.5 rounded-xl text-xs font-semibold transition-all ${
-                activeTab === 'presets' 
-                  ? 'bg-navy-700 text-lime-accent border border-lime-accent/30' 
-                  : 'text-slate-400 hover:text-white'
-              }`}
-            >
-              Demo Sample Bills
-            </button>
-            <label className={`px-3 py-1.5 rounded-xl text-xs font-semibold cursor-pointer transition-all ${
-              activeTab === 'upload' 
-                ? 'bg-navy-700 text-lime-accent border border-lime-accent/30' 
-                : 'text-slate-400 hover:text-white'
-            }`}>
-              <span className="flex items-center gap-1.5">
-                <Upload className="w-3.5 h-3.5" />
-                <span>Upload Invoice</span>
-              </span>
-              <input type="file" accept="image/*" onChange={handleFileUpload} className="hidden" />
-            </label>
-            <button
-              onClick={startCamera}
-              className={`px-3 py-1.5 rounded-xl text-xs font-semibold transition-all flex items-center gap-1.5 ${
-                activeTab === 'camera' 
-                  ? 'bg-navy-700 text-lime-accent border border-lime-accent/30' 
-                  : 'text-slate-400 hover:text-white'
-              }`}
-            >
-              <Camera className="w-3.5 h-3.5" />
-              <span>Camera Scan</span>
-            </button>
-          </div>
-
-          {/* Preset Selector Dropdown */}
-          <div className="flex items-center gap-2">
-            <span className="text-[11px] text-slate-400 hidden sm:inline">Presets:</span>
-            {SAMPLE_INVOICE_PRESETS.map((p, idx) => (
-              <button
-                key={p.id}
-                onClick={() => handleLoadPreset(p)}
-                className="px-2.5 py-1 rounded-lg text-[11px] font-medium bg-navy-800 hover:bg-navy-700 text-slate-300 border border-slate-700 transition-colors"
-              >
-                Sample {idx + 1}: {p.supplierName.split(' ')[0]}
-              </button>
-            ))}
-          </div>
+        {/* 3-Step Pill Bar */}
+        <div className="p-3 bg-navy-950/80 border-b border-slate-800 flex items-center justify-center gap-2 text-xs font-bold shrink-0">
+          <button
+            onClick={() => setCurrentStep(1)}
+            className={`px-3 py-1 rounded-lg ${currentStep === 1 ? 'bg-lime-accent text-navy-950' : 'text-slate-400'}`}
+          >
+            1. Upload
+          </button>
+          <span className="text-slate-600">→</span>
+          <button
+            onClick={() => selectedImage && setCurrentStep(2)}
+            disabled={!selectedImage}
+            className={`px-3 py-1 rounded-lg disabled:opacity-40 ${currentStep === 2 ? 'bg-lime-accent text-navy-950' : 'text-slate-400'}`}
+          >
+            2. Review
+          </button>
+          <span className="text-slate-600">→</span>
+          <button
+            onClick={() => bill && setCurrentStep(3)}
+            disabled={!bill}
+            className={`px-3 py-1 rounded-lg disabled:opacity-40 ${currentStep === 3 ? 'bg-lime-accent text-navy-950' : 'text-slate-400'}`}
+          >
+            3. Confirm
+          </button>
         </div>
 
-        {/* Split Screen Workspace */}
-        <div className="flex-1 grid grid-cols-1 lg:grid-cols-12 overflow-hidden">
+        {/* Modal Body */}
+        <div className="p-5 lg:p-6 space-y-6 flex-1 overflow-y-auto">
           
-          {/* LEFT SIDE: Invoice Image Preview & Camera Controls */}
-          <div className="lg:col-span-5 bg-navy-950 p-4 border-r border-slate-800 flex flex-col justify-between overflow-y-auto">
-            <div>
-              <div className="flex items-center justify-between mb-2">
-                <span className="text-xs font-bold text-slate-300 flex items-center gap-1.5">
-                  <Eye className="w-3.5 h-3.5 text-lime-accent" />
-                  <span>Invoice Image Source</span>
-                </span>
-                {selectedImage && (
+          {/* STEP 1: UPLOAD */}
+          {currentStep === 1 && (
+            <div className="space-y-5 max-w-xl mx-auto py-4">
+              <div 
+                onDragOver={handleDragOver}
+                onDragLeave={handleDragLeave}
+                onDrop={handleDrop}
+                className={`p-8 rounded-3xl border-2 border-dashed text-center transition-all ${
+                  isDragOver ? 'border-lime-accent bg-lime-accent/5' : 'border-slate-700 bg-navy-950/60'
+                }`}
+              >
+                <div className="w-14 h-14 rounded-2xl bg-lime-accent/15 text-lime-accent flex items-center justify-center mx-auto mb-3">
+                  <Upload className="w-7 h-7" />
+                </div>
+                <h4 className="text-base font-bold text-white">Select Distributor Bill Image</h4>
+                <p className="text-xs text-slate-400 mt-1 mb-5">
+                  Drag & drop your invoice photo, or click below
+                </p>
+
+                <div className="flex flex-col sm:flex-row items-center justify-center gap-3">
+                  <label className="w-full sm:w-auto px-5 py-2.5 rounded-xl bg-lime-accent hover:bg-lime-hover text-navy-950 font-bold text-xs shadow-lime-glow cursor-pointer transition-all flex items-center justify-center gap-1.5">
+                    <Upload className="w-4 h-4" />
+                    <span>Upload Bill</span>
+                    <input type="file" accept="image/*" onChange={handleFileInputChange} className="hidden" />
+                  </label>
+
                   <button
-                    onClick={() => runOcr(selectedImage)}
-                    disabled={isScanning}
-                    className="text-[11px] text-mint-accent hover:underline flex items-center gap-1"
+                    onClick={handleStartCamera}
+                    className="w-full sm:w-auto px-5 py-2.5 rounded-xl bg-navy-900 border border-slate-700 text-slate-200 hover:text-white font-bold text-xs flex items-center justify-center gap-1.5"
                   >
-                    <RefreshCw className={`w-3 h-3 ${isScanning ? 'animate-spin' : ''}`} />
-                    <span>Re-run OCR</span>
+                    <Camera className="w-4 h-4 text-mint-accent" />
+                    <span>Open Camera</span>
                   </button>
-                )}
+                </div>
               </div>
 
-              {/* Camera Live Feed if Active */}
-              {cameraActive ? (
-                <div className="relative rounded-2xl overflow-hidden border-2 border-lime-accent bg-black aspect-[4/3] flex items-center justify-center">
-                  <video ref={videoRef} className="w-full h-full object-cover" />
-                  <div className="absolute inset-0 border-2 border-dashed border-lime-accent/60 pointer-events-none m-4 rounded-xl flex items-center justify-center">
-                    <span className="bg-black/60 px-2.5 py-1 rounded text-[11px] text-lime-accent font-mono">
-                      Align bill inside box
-                    </span>
-                  </div>
-                  <div className="absolute bottom-4 left-0 right-0 flex justify-center">
-                    <button
-                      onClick={capturePhoto}
-                      className="px-5 py-2 rounded-xl bg-lime-accent text-navy-950 font-bold text-xs shadow-lime-glow hover:bg-lime-hover"
-                    >
-                      📸 Snap & Run OCR
+              {cameraActive && (
+                <div className="p-4 rounded-2xl bg-black border border-slate-700 space-y-3">
+                  <video ref={videoRef} autoPlay playsInline className="w-full aspect-video rounded-xl object-cover" />
+                  <div className="flex justify-end gap-2">
+                    <button onClick={handleCloseCamera} className="px-3 py-1.5 rounded-lg bg-slate-800 text-xs text-slate-300">
+                      Cancel
+                    </button>
+                    <button onClick={handleCapturePhoto} className="px-4 py-1.5 rounded-lg bg-lime-accent text-navy-950 text-xs font-bold">
+                      Capture
                     </button>
                   </div>
                 </div>
-              ) : selectedImage ? (
-                <div className="relative rounded-2xl overflow-hidden border border-slate-700 bg-navy-900 group">
-                  <img
-                    src={selectedImage}
-                    alt="Invoice Preview"
-                    className="w-full h-auto max-h-[380px] object-cover group-hover:scale-105 transition-transform duration-300"
-                  />
-                  {isScanning && (
-                    <div className="absolute inset-x-0 h-1 bg-lime-accent shadow-lime-glow animate-scan-beam pointer-events-none" />
-                  )}
-                  <div className="absolute top-2 left-2 px-2 py-0.5 rounded bg-black/70 text-[10px] text-slate-300 font-mono">
-                    High Resolution Sample Document
-                  </div>
-                </div>
-              ) : (
-                <div className="h-64 rounded-2xl border-2 border-dashed border-slate-700 flex flex-col items-center justify-center text-slate-400 p-6 text-center">
-                  <Upload className="w-8 h-8 text-slate-500 mb-2" />
-                  <p className="text-xs font-semibold text-slate-300">No invoice image loaded</p>
-                  <p className="text-[11px] text-slate-500 mt-1">Upload a photo, snap using camera, or pick a demo bill preset</p>
-                </div>
               )}
 
-              {/* OCR Progress Indicator */}
+              {/* Sample testing presets */}
+              <div className="p-3.5 rounded-2xl bg-navy-950 border border-slate-800 text-xs flex items-center justify-between gap-3">
+                <span className="text-slate-400 font-medium">Try Sample Bill (DEMO):</span>
+                <div className="flex items-center gap-2">
+                  {SAMPLE_INVOICE_PRESETS.map(preset => (
+                    <button
+                      key={preset.id}
+                      onClick={() => handleLoadSample(preset.id)}
+                      className="px-2.5 py-1 rounded-lg bg-navy-900 hover:bg-navy-800 border border-slate-700 text-[11px] font-bold text-slate-200"
+                    >
+                      {preset.supplierName.split(' ')[0]} ({formatINR(preset.printedTotal)})
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* STEP 2: REVIEW */}
+          {currentStep === 2 && bill && (
+            <div className="space-y-5">
+              
               {isScanning && (
-                <div className="mt-3 p-3 rounded-xl bg-navy-900 border border-slate-800 space-y-2 animate-in fade-in">
-                  <div className="flex items-center justify-between text-xs">
-                    <span className="text-slate-300 font-medium">{scanStatus}</span>
-                    <span className="font-mono text-lime-accent font-bold">{scanProgress}%</span>
-                  </div>
-                  <div className="w-full h-1.5 rounded-full bg-navy-950 overflow-hidden">
-                    <div 
-                      className="h-full bg-lime-accent transition-all duration-300"
-                      style={{ width: `${scanProgress}%` }}
-                    />
-                  </div>
+                <div className="p-3 rounded-xl bg-navy-950 border border-mint-accent/50 text-xs flex items-center justify-between text-mint-accent">
+                  <span className="flex items-center gap-2">
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin text-lime-accent" />
+                    <span>{scanStatus}</span>
+                  </span>
+                  <span className="font-mono font-bold text-lime-accent">{scanProgress}%</span>
                 </div>
               )}
-            </div>
 
-            {/* Verification Disclaimer */}
-            <div className="mt-4 p-3 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-300 text-[11px] leading-relaxed">
-              <strong className="block font-semibold mb-0.5">⚠️ OCR Auditing Safeguard:</strong>
-              Never treat raw OCR output as authentic verification. Always check the calculated items total against the printed bill before confirming.
-            </div>
-          </div>
+              {bill.warnings.length > 0 && !isScanning && (
+                <div className="p-3 rounded-xl bg-amber-950/40 border border-amber-800/60 text-amber-300 text-xs space-y-1">
+                  <div className="flex items-center gap-1.5 font-bold">
+                    <AlertTriangle className="w-4 h-4 shrink-0" />
+                    <span>Discrepancy / Attention Items:</span>
+                  </div>
+                  <ul className="list-disc list-inside space-y-0.5 text-[11px] text-amber-200/90">
+                    {bill.warnings.map((w, i) => (
+                      <li key={i}>{w}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
 
-          {/* RIGHT SIDE: Extracted & Editable Fields */}
-          <div className="lg:col-span-7 bg-navy-900 p-5 overflow-y-auto flex flex-col justify-between space-y-4">
-            {parsedBill ? (
-              <div className="space-y-4">
-                {/* Meta details (Supplier, Invoice #, Date) */}
-                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                  <div>
-                    <label className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Supplier Name</label>
-                    <input
-                      type="text"
-                      value={parsedBill.supplierName}
-                      onChange={(e) => setParsedBill({ ...parsedBill, supplierName: e.target.value })}
-                      className="mt-1 w-full px-3 py-2 rounded-xl bg-navy-800 border border-slate-700 text-xs text-white focus:outline-none focus:border-lime-accent"
-                    />
+              <div className="grid grid-cols-1 md:grid-cols-12 gap-5 items-start">
+                
+                {/* Left Preview */}
+                <div className="md:col-span-4 rounded-2xl border border-slate-800 bg-navy-950 p-3 space-y-2">
+                  <div className="flex items-center justify-between text-[11px] text-slate-400 font-bold">
+                    <span>Original Document</span>
+                    <button onClick={handleClearImage} className="text-rose-400 hover:underline">
+                      Replace
+                    </button>
                   </div>
-                  <div>
-                    <label className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Invoice Number</label>
-                    <input
-                      type="text"
-                      value={parsedBill.invoiceNo}
-                      onChange={(e) => setParsedBill({ ...parsedBill, invoiceNo: e.target.value })}
-                      className="mt-1 w-full px-3 py-2 rounded-xl bg-navy-800 border border-slate-700 text-xs text-white focus:outline-none focus:border-lime-accent font-mono"
-                    />
-                  </div>
-                  <div>
-                    <label className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Invoice Date</label>
-                    <input
-                      type="date"
-                      value={parsedBill.date}
-                      onChange={(e) => setParsedBill({ ...parsedBill, date: e.target.value })}
-                      className="mt-1 w-full px-3 py-2 rounded-xl bg-navy-800 border border-slate-700 text-xs text-white focus:outline-none focus:border-lime-accent"
-                    />
-                  </div>
+                  {selectedImage && (
+                    <div className="rounded-xl overflow-hidden border border-slate-800 bg-black max-h-72 overflow-y-auto">
+                      <img src={selectedImage} alt="Bill" className="w-full h-auto object-contain" />
+                    </div>
+                  )}
+                  <p className="text-[10px] text-slate-500 font-mono truncate">{fileName}</p>
                 </div>
 
-                {/* Mathematical Check Warning if discrepancy exists */}
-                {parsedBill.warnings && parsedBill.warnings.length > 0 && (
-                  <div className="p-3 rounded-xl bg-rose-500/15 border border-rose-500/40 text-rose-300 text-xs flex items-start gap-2.5">
-                    <AlertTriangle className="w-4 h-4 shrink-0 text-rose-400 mt-0.5" />
+                {/* Right Form */}
+                <div className="md:col-span-8 space-y-4">
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
                     <div>
-                      <p className="font-bold">Discrepancy Flagged by Verification Engine</p>
-                      <p className="text-[11px] text-rose-200 mt-0.5">{parsedBill.warnings[0]}</p>
+                      <label className="text-[10px] font-bold uppercase text-slate-400">Supplier Name</label>
+                      <input
+                        type="text"
+                        value={bill.supplierName}
+                        onChange={(e) => handleFieldChange('supplierName', e.target.value)}
+                        placeholder="Supplier name"
+                        className="mt-1 w-full px-2.5 py-1.5 rounded-lg bg-navy-950 border border-slate-700 text-xs text-white focus:outline-none focus:border-lime-accent"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="text-[10px] font-bold uppercase text-slate-400">Invoice No</label>
+                      <input
+                        type="text"
+                        value={bill.invoiceNo}
+                        onChange={(e) => handleFieldChange('invoiceNo', e.target.value)}
+                        className="mt-1 w-full px-2.5 py-1.5 rounded-lg bg-navy-950 border border-slate-700 text-xs text-white focus:outline-none focus:border-lime-accent"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="text-[10px] font-bold uppercase text-slate-400">Printed Total (₹)</label>
+                      <input
+                        type="number"
+                        value={bill.printedTotal}
+                        onChange={(e) => handleFieldChange('printedTotal', parseFloat(e.target.value) || 0)}
+                        className="mt-1 w-full px-2.5 py-1.5 rounded-lg bg-navy-950 border border-slate-700 text-xs text-white font-mono font-bold focus:outline-none focus:border-lime-accent"
+                      />
                     </div>
                   </div>
-                )}
 
-                {/* Line Items Table */}
-                <div>
-                  <div className="flex items-center justify-between mb-2">
-                    <span className="text-xs font-bold text-slate-200 uppercase tracking-wider">
-                      Extracted Line Items ({parsedBill.items.length})
-                    </span>
-                    <button
-                      onClick={handleAddItem}
-                      className="px-2.5 py-1 rounded-lg bg-navy-800 hover:bg-navy-700 text-lime-accent text-xs font-semibold border border-slate-700 flex items-center gap-1"
-                    >
-                      <Plus className="w-3.5 h-3.5" />
-                      <span>Add Item</span>
-                    </button>
-                  </div>
+                  {/* Line Items */}
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between text-xs">
+                      <span className="font-bold text-white">Line Items ({bill.items.length})</span>
+                      <button
+                        onClick={handleAddItem}
+                        className="px-2 py-0.5 rounded-lg bg-lime-accent/20 text-lime-accent text-[11px] font-bold flex items-center gap-1"
+                      >
+                        <Plus className="w-3 h-3" />
+                        <span>Add Item</span>
+                      </button>
+                    </div>
 
-                  <div className="rounded-xl border border-slate-800 overflow-hidden bg-navy-950/80">
-                    <div className="max-h-52 overflow-y-auto">
+                    <div className="overflow-x-auto rounded-xl border border-slate-800 bg-navy-950">
                       <table className="w-full text-left text-xs">
-                        <thead className="bg-navy-900 text-slate-400 sticky top-0 text-[10px] uppercase tracking-wider">
+                        <thead className="bg-navy-900 text-slate-400 text-[10px] uppercase font-bold">
                           <tr>
-                            <th className="py-2 px-3">Item Description</th>
-                            <th className="py-2 px-2 text-right">Qty</th>
-                            <th className="py-2 px-2 text-right">Rate (₹)</th>
-                            <th className="py-2 px-2 text-right">Amount (₹)</th>
-                            <th className="py-2 px-2 text-center">Action</th>
+                            <th className="p-2">Item</th>
+                            <th className="p-2 w-14 text-center">Qty</th>
+                            <th className="p-2 w-16 text-center">Unit</th>
+                            <th className="p-2 w-16 text-right">Rate</th>
+                            <th className="p-2 w-20 text-right">Amount</th>
+                            <th className="p-2 w-8 text-center"></th>
                           </tr>
                         </thead>
-                        <tbody className="divide-y divide-slate-800/80">
-                          {parsedBill.items.map((item, idx) => (
-                            <tr key={item.id} className="hover:bg-navy-900/50">
-                              <td className="py-1.5 px-3">
+                        <tbody className="divide-y divide-slate-800">
+                          {bill.items.map((item, idx) => (
+                            <tr key={item.id}>
+                              <td className="p-1.5">
                                 <input
                                   type="text"
                                   value={item.name}
                                   onChange={(e) => handleItemChange(idx, 'name', e.target.value)}
-                                  className="w-full bg-transparent text-white border-b border-transparent hover:border-slate-700 focus:border-lime-accent focus:outline-none"
+                                  className="w-full px-1.5 py-1 rounded bg-navy-900 border border-slate-700 text-xs text-white"
                                 />
                               </td>
-                              <td className="py-1.5 px-2 text-right">
+                              <td className="p-1.5">
                                 <input
                                   type="number"
                                   value={item.quantity}
                                   onChange={(e) => handleItemChange(idx, 'quantity', parseFloat(e.target.value) || 0)}
-                                  className="w-14 bg-transparent text-right text-white border-b border-transparent hover:border-slate-700 focus:border-lime-accent focus:outline-none"
+                                  className="w-full px-1 py-1 rounded bg-navy-900 border border-slate-700 text-xs text-white text-center font-mono"
                                 />
                               </td>
-                              <td className="py-1.5 px-2 text-right">
+                              <td className="p-1.5">
+                                <select
+                                  value={item.unit}
+                                  onChange={(e) => handleItemChange(idx, 'unit', e.target.value as UnitType)}
+                                  className="w-full px-1 py-1 rounded bg-navy-900 border border-slate-700 text-xs text-slate-300"
+                                >
+                                  <option value="kg">kg</option>
+                                  <option value="packet">packet</option>
+                                  <option value="piece">piece</option>
+                                  <option value="litre">litre</option>
+                                  <option value="box">box</option>
+                                  <option value="bottle">bottle</option>
+                                </select>
+                              </td>
+                              <td className="p-1.5">
                                 <input
                                   type="number"
                                   value={item.rate}
                                   onChange={(e) => handleItemChange(idx, 'rate', parseFloat(e.target.value) || 0)}
-                                  className="w-16 bg-transparent text-right text-white border-b border-transparent hover:border-slate-700 focus:border-lime-accent focus:outline-none font-mono"
+                                  className="w-full px-1.5 py-1 rounded bg-navy-900 border border-slate-700 text-xs text-white text-right font-mono"
                                 />
                               </td>
-                              <td className="py-1.5 px-2 text-right font-bold text-slate-200 font-mono">
-                                {formatINR(item.amount)}
+                              <td className="p-1.5">
+                                <input
+                                  type="number"
+                                  value={item.amount}
+                                  onChange={(e) => handleItemChange(idx, 'amount', parseFloat(e.target.value) || 0)}
+                                  className="w-full px-1.5 py-1 rounded bg-navy-900 border border-slate-700 text-xs text-white text-right font-mono font-bold"
+                                />
                               </td>
-                              <td className="py-1.5 px-2 text-center">
-                                <button
-                                  onClick={() => handleDeleteItem(idx)}
-                                  className="text-slate-500 hover:text-rose-400 p-1"
-                                >
+                              <td className="p-1.5 text-center">
+                                <button onClick={() => handleDeleteItem(idx)} className="text-slate-500 hover:text-rose-400">
                                   <Trash2 className="w-3.5 h-3.5" />
                                 </button>
                               </td>
@@ -535,86 +620,155 @@ export const BillScannerModal: React.FC<BillScannerModalProps> = ({ isOpen, onCl
                       </table>
                     </div>
                   </div>
-                </div>
 
-                {/* Mathematical Reconciliation Summary */}
-                <div className="p-3.5 rounded-2xl bg-navy-950 border border-slate-800 grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
-                  <div>
-                    <span className="text-[10px] uppercase font-bold text-slate-400">Sum of Items</span>
-                    <p className="font-bold text-white text-sm font-mono">{formatINR(parsedBill.calculatedSubtotal)}</p>
-                  </div>
-                  <div>
-                    <span className="text-[10px] uppercase font-bold text-slate-400">Estimated Tax</span>
-                    <p className="font-bold text-white text-sm font-mono">{formatINR(parsedBill.taxAmount)}</p>
-                  </div>
-                  <div>
-                    <span className="text-[10px] uppercase font-bold text-slate-400">Printed Total</span>
-                    <p className="font-extrabold text-lime-accent text-base font-mono">
-                      {formatINR(parsedBill.printedTotal)}
-                    </p>
-                  </div>
-                  <div>
-                    <span className="text-[10px] uppercase font-bold text-slate-400">Confidence Score</span>
-                    <p className="font-bold text-mint-accent text-sm">
-                      {parsedBill.confidence}% Verified
-                    </p>
+                  {/* Totals */}
+                  <div className="p-3 rounded-xl bg-navy-950 border border-slate-800 text-xs space-y-1">
+                    <div className="flex justify-between text-slate-400">
+                      <span>Calculated Line Items Total:</span>
+                      <span className="font-mono font-bold text-white">{formatINR(bill.calculatedTotal)}</span>
+                    </div>
+                    <div className="flex justify-between text-slate-400">
+                      <span>Printed Bill Total:</span>
+                      <span className="font-mono font-bold text-lime-accent">{formatINR(bill.printedTotal)}</span>
+                    </div>
+                    {Math.abs(bill.difference) > 0.5 && (
+                      <p className="text-[11px] text-amber-300 pt-1 border-t border-slate-800">
+                        Discrepancy: Difference of {formatINR(Math.abs(bill.difference))} detected.
+                      </p>
+                    )}
                   </div>
                 </div>
 
-                {/* Review & Inventory Checkboxes */}
-                <div className="space-y-2 pt-1">
-                  <label className="flex items-center gap-2.5 cursor-pointer text-xs text-slate-200">
-                    <input
-                      type="checkbox"
-                      checked={verifiedByUser}
-                      onChange={(e) => setVerifiedByUser(e.target.checked)}
-                      className="w-4 h-4 rounded text-lime-accent focus:ring-0 bg-navy-800 border-slate-700"
-                    />
-                    <span className="font-semibold text-lime-accent">
-                      I have physically reviewed and verified these invoice values and line items.
-                    </span>
-                  </label>
+              </div>
 
-                  <label className="flex items-center gap-2.5 cursor-pointer text-xs text-slate-300">
+              {/* Step Navigation */}
+              <div className="flex items-center justify-between pt-3 border-t border-slate-800">
+                <button
+                  onClick={() => setCurrentStep(1)}
+                  className="px-3.5 py-1.5 rounded-xl bg-slate-800 text-slate-300 text-xs font-semibold flex items-center gap-1"
+                >
+                  <ArrowLeft className="w-3.5 h-3.5" />
+                  <span>Back</span>
+                </button>
+
+                <button
+                  onClick={() => setCurrentStep(3)}
+                  className="px-5 py-2 rounded-xl bg-lime-accent text-navy-950 font-extrabold text-xs shadow-lime-glow flex items-center gap-1.5"
+                >
+                  <span>Proceed to Confirm</span>
+                  <ArrowRight className="w-3.5 h-3.5" />
+                </button>
+              </div>
+
+            </div>
+          )}
+
+          {/* STEP 3: CONFIRM */}
+          {currentStep === 3 && bill && (
+            <div className="max-w-lg mx-auto space-y-5 py-2">
+              {!saveSuccess ? (
+                <div className="p-5 rounded-2xl bg-navy-950 border border-slate-800 space-y-4">
+                  <h4 className="text-sm font-extrabold text-white text-center">Confirm & Save Expense</h4>
+
+                  <div className="space-y-2 text-xs">
+                    <div className="flex justify-between text-slate-400">
+                      <span>Supplier:</span>
+                      <strong className="text-white">{bill.supplierName}</strong>
+                    </div>
+                    <div className="flex justify-between text-slate-400">
+                      <span>Invoice Number:</span>
+                      <span className="font-mono text-slate-200">#{bill.invoiceNo || 'N/A'}</span>
+                    </div>
+                    <div className="flex justify-between text-slate-400">
+                      <span>Date:</span>
+                      <span className="text-slate-200">{bill.date}</span>
+                    </div>
+                    <div className="flex justify-between text-slate-400">
+                      <span>Items Count:</span>
+                      <span className="text-slate-200">{bill.items.length} items</span>
+                    </div>
+                    <div className="flex justify-between pt-2 border-t border-slate-800 text-sm">
+                      <span className="font-bold text-white">Expense Amount:</span>
+                      <span className="font-mono font-black text-lime-accent">
+                        {formatINR(bill.printedTotal || bill.calculatedTotal)}
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Update Stock (OFF by default) */}
+                  <label className="flex items-start gap-2.5 p-3 rounded-xl bg-navy-900 border border-slate-800 cursor-pointer select-none">
                     <input
                       type="checkbox"
                       checked={updateStockChecked}
                       onChange={(e) => setUpdateStockChecked(e.target.checked)}
-                      className="w-4 h-4 rounded text-mint-accent focus:ring-0 bg-navy-800 border-slate-700"
+                      className="mt-0.5 w-4 h-4 rounded text-lime-accent accent-lime-accent cursor-pointer"
                     />
-                    <span>
-                      Also update inventory stock for matched products (Stock-Inward transaction)
-                    </span>
+                    <div className="text-xs">
+                      <span className="font-bold text-white block">Update Stock (Inward)</span>
+                      <span className="text-[10px] text-slate-400 block">Increase inventory for matched products</span>
+                    </div>
                   </label>
+
+                  <div className="flex items-center justify-between gap-2 pt-2">
+                    <button
+                      onClick={() => setCurrentStep(2)}
+                      className="px-3.5 py-2 rounded-xl bg-slate-800 text-slate-300 text-xs font-semibold flex items-center gap-1"
+                    >
+                      <ArrowLeft className="w-3.5 h-3.5" />
+                      <span>Edit</span>
+                    </button>
+
+                    <button
+                      onClick={handleSaveConfirmedExpense}
+                      disabled={isSaving}
+                      className="px-6 py-2 rounded-xl bg-lime-accent hover:bg-lime-hover text-navy-950 font-black text-xs shadow-lime-glow disabled:opacity-50 flex items-center gap-1.5"
+                    >
+                      {isSaving ? (
+                        <>
+                          <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                          <span>Saving...</span>
+                        </>
+                      ) : (
+                        <>
+                          <CheckCircle2 className="w-4 h-4" />
+                          <span>Confirm & Save Expense</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
                 </div>
-              </div>
-            ) : (
-              <div className="flex-1 flex flex-col items-center justify-center text-slate-400">
-                <FileText className="w-10 h-10 text-slate-600 mb-2" />
-                <p className="text-sm font-semibold">Select or capture an invoice to view extracted fields</p>
-              </div>
-            )}
-
-            {/* Bottom Actions */}
-            <div className="pt-3 border-t border-slate-800 flex items-center justify-between">
-              <button
-                onClick={onClose}
-                className="px-4 py-2 rounded-xl bg-navy-800 text-slate-300 hover:text-white text-xs font-semibold"
-              >
-                Cancel / रद्द करें
-              </button>
-
-              <button
-                onClick={handleSaveVerifiedBill}
-                disabled={!parsedBill || !verifiedByUser}
-                className="px-5 py-2.5 rounded-xl bg-lime-accent hover:bg-lime-hover text-navy-950 font-bold text-xs shadow-lime-glow disabled:opacity-40 disabled:pointer-events-none transition-all flex items-center gap-2"
-              >
-                <CheckCircle2 className="w-4 h-4" />
-                <span>Confirm & Record Expense ({formatINR(parsedBill?.printedTotal || 0)})</span>
-              </button>
+              ) : (
+                <div className="p-6 rounded-2xl bg-navy-950 border border-emerald-800/60 text-center space-y-4">
+                  <div className="w-12 h-12 rounded-full bg-emerald-500/20 text-emerald-400 flex items-center justify-center mx-auto">
+                    <CheckCircle2 className="w-6 h-6" />
+                  </div>
+                  <div>
+                    <h4 className="text-base font-bold text-white">Invoice Recorded Successfully!</h4>
+                    <p className="text-xs text-slate-400 mt-1">
+                      Recorded expense of {formatINR(bill.printedTotal || bill.calculatedTotal)} under {bill.supplierName}.
+                    </p>
+                  </div>
+                  <div className="flex justify-center gap-2">
+                    <button
+                      onClick={onClose}
+                      className="px-5 py-2 rounded-xl bg-slate-800 text-white text-xs font-bold"
+                    >
+                      Close
+                    </button>
+                    <button
+                      onClick={handleClearImage}
+                      className="px-5 py-2 rounded-xl bg-lime-accent text-navy-950 text-xs font-bold shadow-lime-glow"
+                    >
+                      Scan Another
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
-          </div>
+          )}
+
         </div>
+
       </div>
     </div>
   );
